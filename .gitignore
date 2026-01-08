@@ -1,0 +1,52 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Configuration (contains API keys)
+config.json
+settings.json
+**/config.json
+!config/config.example.json
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Test outputs
+test-results/
+coverage/
+
+# Build artifacts
+dist/
+build/
+*.tar.gz
+
+# Personal notes
+notes.md
+TODO.md
+SCRATCH.md

@@ -1,0 +1,41 @@
+{
+  "providers": [
+    {
+      "name": "mageagent",
+      "api_base_url": "http://localhost:3457/v1/chat/completions",
+      "api_key": "local",
+      "models": [
+        "mageagent:auto",
+        "mageagent:hybrid",
+        "mageagent:validated",
+        "mageagent:compete",
+        "mageagent:tools",
+        "mageagent:primary",
+        "mageagent:validator",
+        "mageagent:competitor"
+      ]
+    },
+    {
+      "name": "ollama",
+      "api_base_url": "http://localhost:11434/v1/chat/completions",
+      "api_key": "ollama",
+      "models": [
+        "qwen2.5:72b",
+        "qwen2.5-coder:32b",
+        "qwen2.5-coder:1.5b"
+      ]
+    },
+    {
+      "name": "anthropic",
+      "api_base_url": "https://api.anthropic.com",
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "models": [
+        "claude-opus-4-5-20251101",
+        "claude-sonnet-4-5-20250929"
+      ]
+    }
+  ],
+  "Router": {
+    "default": "mageagent,mageagent:hybrid"
+  }
+}
