@@ -230,33 +230,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         menu.addItem(NSMenuItem.separator())
 
         // System Pressure Section - Activity Monitor style
-        let pressureHeader = NSMenuItem(title: "System Resources", action: nil, keyEquivalent: "")
+        // IMPORTANT: Use displayOnlyAction instead of nil/disabled to prevent macOS from dimming text
+        let pressureHeader = NSMenuItem(title: "System Resources", action: #selector(displayOnlyAction(_:)), keyEquivalent: "")
         pressureHeader.tag = MenuItemTag.systemPressure.rawValue
-        pressureHeader.isEnabled = false
+        pressureHeader.target = self
+        pressureHeader.isEnabled = true  // Keep enabled for full opacity text
 
         // Create attributed string with colored indicator
         let pressureAttr = NSMutableAttributedString(string: "● ", attributes: [.foregroundColor: NSColor.systemGreen])
-        pressureAttr.append(NSAttributedString(string: "System Resources", attributes: [.foregroundColor: NSColor.labelColor]))
+        pressureAttr.append(NSAttributedString(string: "System Resources", attributes: [
+            .foregroundColor: NSColor.black,
+            .font: NSFont.systemFont(ofSize: 13, weight: .bold)
+        ]))
         pressureHeader.attributedTitle = pressureAttr
 
         menu.addItem(pressureHeader)
 
-        // Memory detail item
-        let memoryItem = NSMenuItem(title: "  Memory: Checking...", action: nil, keyEquivalent: "")
+        // Memory detail item - enabled with no-op action for full opacity
+        let memoryItem = NSMenuItem(title: "  Memory: Checking...", action: #selector(displayOnlyAction(_:)), keyEquivalent: "")
         memoryItem.tag = MenuItemTag.memoryDetail.rawValue
-        memoryItem.isEnabled = false
+        memoryItem.target = self
+        memoryItem.isEnabled = true
         menu.addItem(memoryItem)
 
-        // CPU detail item
-        let cpuItem = NSMenuItem(title: "  CPU: Checking...", action: nil, keyEquivalent: "")
+        // CPU detail item - enabled with no-op action for full opacity
+        let cpuItem = NSMenuItem(title: "  CPU: Checking...", action: #selector(displayOnlyAction(_:)), keyEquivalent: "")
         cpuItem.tag = MenuItemTag.cpuDetail.rawValue
-        cpuItem.isEnabled = false
+        cpuItem.target = self
+        cpuItem.isEnabled = true
         menu.addItem(cpuItem)
 
-        // GPU/Metal detail item
-        let gpuItem = NSMenuItem(title: "  GPU/Metal: Checking...", action: nil, keyEquivalent: "")
+        // GPU/Metal detail item - enabled with no-op action for full opacity
+        let gpuItem = NSMenuItem(title: "  GPU/Metal: Checking...", action: #selector(displayOnlyAction(_:)), keyEquivalent: "")
         gpuItem.tag = MenuItemTag.gpuDetail.rawValue
-        gpuItem.isEnabled = false
+        gpuItem.target = self
+        gpuItem.isEnabled = true
         menu.addItem(gpuItem)
 
         menu.addItem(NSMenuItem.separator())
@@ -416,6 +424,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         default:
             return true
         }
+    }
+
+    // MARK: - No-Op Action for Display-Only Menu Items
+    // macOS automatically dims disabled menu items, so we use enabled items with a no-op action
+    // to keep text at full opacity while remaining non-interactive
+
+    @objc func displayOnlyAction(_ sender: NSMenuItem) {
+        // Intentionally empty - this keeps menu items enabled (full opacity)
+        // while not performing any action when clicked
     }
 
     // MARK: - Server Control Actions
@@ -1581,44 +1598,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             overallPressure = .nominal
         }
 
+        // CRITICAL: Use explicit black/white based on appearance, NOT semantic colors
+        // macOS dims all semantic colors for disabled menu items, so we must use raw colors
+        let isDarkMode = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let textColor = isDarkMode ? NSColor.white : NSColor.black
+
         // Update header with overall pressure
         if let headerItem = menu.item(withTag: MenuItemTag.systemPressure.rawValue) {
             let headerAttr = NSMutableAttributedString(string: "\(overallPressure.indicator) ", attributes: [.foregroundColor: overallPressure.color])
             headerAttr.append(NSAttributedString(string: "System Resources", attributes: [
-                .foregroundColor: NSColor.labelColor,
-                .font: NSFont.systemFont(ofSize: 13, weight: .medium)
+                .foregroundColor: textColor,
+                .font: NSFont.systemFont(ofSize: 13, weight: .bold)
             ]))
             headerItem.attributedTitle = headerAttr
         }
 
-        // Update memory detail - use labelColor for readability in both light/dark mode
+        // Update memory detail - use explicit black/white for full opacity
         if let memItem = menu.item(withTag: MenuItemTag.memoryDetail.rawValue) {
             let memText = String(format: "Memory: %.1f / %.1f GB (%.0f%%)", memory.usedGB, memory.totalGB, memory.percentUsed)
             let memAttr = NSMutableAttributedString(string: "  \(memory.pressure.indicator) ", attributes: [.foregroundColor: memory.pressure.color])
             memAttr.append(NSAttributedString(string: memText, attributes: [
-                .foregroundColor: NSColor.labelColor,
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+                .foregroundColor: textColor,
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
             ]))
             memItem.attributedTitle = memAttr
         }
 
-        // Update CPU detail - use labelColor for readability
+        // Update CPU detail - use explicit black/white
         if let cpuItem = menu.item(withTag: MenuItemTag.cpuDetail.rawValue) {
             let cpuText = String(format: "CPU: %.1f%%", cpu.usage)
             let cpuAttr = NSMutableAttributedString(string: "  \(cpu.pressure.indicator) ", attributes: [.foregroundColor: cpu.pressure.color])
             cpuAttr.append(NSAttributedString(string: cpuText, attributes: [
-                .foregroundColor: NSColor.labelColor,
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+                .foregroundColor: textColor,
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
             ]))
             cpuItem.attributedTitle = cpuAttr
         }
 
-        // Update GPU detail - use labelColor for readability
+        // Update GPU detail - use explicit black/white
         if let gpuItem = menu.item(withTag: MenuItemTag.gpuDetail.rawValue) {
             let gpuAttr = NSMutableAttributedString(string: "  \(gpu.pressure.indicator) ", attributes: [.foregroundColor: gpu.pressure.color])
             gpuAttr.append(NSAttributedString(string: gpu.description, attributes: [
-                .foregroundColor: NSColor.labelColor,
-                .font: NSFont.systemFont(ofSize: 12, weight: .regular)
+                .foregroundColor: textColor,
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
             ]))
             gpuItem.attributedTitle = gpuAttr
         }
