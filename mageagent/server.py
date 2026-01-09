@@ -15,6 +15,9 @@ Patterns:
 - mageagent:fast - Quick responses with 7B model
 """
 
+# Version - keep in sync with package.json
+VERSION = "2.1.0"
+
 import asyncio
 import json
 import os
@@ -95,6 +98,19 @@ MODELS = {
 # Lazy-loaded models cache
 loaded_models: Dict[str, Any] = {}
 model_tokenizers: Dict[str, Any] = {}
+
+# Stats tracking for throughput monitoring
+inference_stats: Dict[str, Any] = {
+    "total_requests": 0,
+    "total_tokens_generated": 0,
+    "last_inference": None,  # timestamp
+    "last_model": None,
+    "last_tokens_per_sec": 0.0,
+    "last_tokens_generated": 0,
+    "last_duration_sec": 0.0,
+    "requests_by_model": {},
+    "tokens_by_model": {},
+}
 
 # Request/Response models
 class ChatMessage(BaseModel):
@@ -237,6 +253,9 @@ async def _generate_internal(model_type: str, messages: List[ChatMessage], max_t
     model, tokenizer = await load_model_async(model_type)
     prompt = format_chat_prompt(messages, tokenizer)
 
+    # Track start time for throughput calculation
+    gen_start = time.time()
+
     # Run generation in a thread pool to not block event loop
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
@@ -249,6 +268,29 @@ async def _generate_internal(model_type: str, messages: List[ChatMessage], max_t
             verbose=False
         )
     )
+
+    # Calculate and update stats
+    gen_duration = time.time() - gen_start
+    # Estimate tokens generated (rough estimate based on response length)
+    # More accurate would be to use tokenizer.encode, but this is faster
+    tokens_generated = len(response.split()) + len(response) // 4  # rough estimate
+    tokens_per_sec = tokens_generated / gen_duration if gen_duration > 0 else 0
+
+    # Update global stats
+    inference_stats["total_requests"] += 1
+    inference_stats["total_tokens_generated"] += tokens_generated
+    inference_stats["last_inference"] = time.time()
+    inference_stats["last_model"] = model_type
+    inference_stats["last_tokens_per_sec"] = round(tokens_per_sec, 1)
+    inference_stats["last_tokens_generated"] = tokens_generated
+    inference_stats["last_duration_sec"] = round(gen_duration, 2)
+
+    # Track per-model stats
+    if model_type not in inference_stats["requests_by_model"]:
+        inference_stats["requests_by_model"][model_type] = 0
+        inference_stats["tokens_by_model"][model_type] = 0
+    inference_stats["requests_by_model"][model_type] += 1
+    inference_stats["tokens_by_model"][model_type] += tokens_generated
 
     return response
 
@@ -866,8 +908,25 @@ async def list_models():
 async def health():
     return {
         "status": "healthy",
+        "version": VERSION,
         "loaded_models": list(loaded_models.keys()),
         "available_models": list(MODELS.keys())
+    }
+
+
+@app.get("/stats")
+async def stats():
+    """Return inference statistics for monitoring throughput"""
+    return {
+        "total_requests": inference_stats["total_requests"],
+        "total_tokens_generated": inference_stats["total_tokens_generated"],
+        "last_inference": inference_stats["last_inference"],
+        "last_model": inference_stats["last_model"],
+        "last_tokens_per_sec": inference_stats["last_tokens_per_sec"],
+        "last_tokens_generated": inference_stats["last_tokens_generated"],
+        "last_duration_sec": inference_stats["last_duration_sec"],
+        "requests_by_model": inference_stats["requests_by_model"],
+        "tokens_by_model": inference_stats["tokens_by_model"],
     }
 
 

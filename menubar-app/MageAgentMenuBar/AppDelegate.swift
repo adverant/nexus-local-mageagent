@@ -72,6 +72,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case memoryDetail = 601
         case cpuDetail = 602
         case gpuDetail = 603
+        case neuralEngineDetail = 604
+        case throughputDetail = 605
     }
 
     // MARK: - Configuration
@@ -155,6 +157,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// Previous CPU ticks for delta calculation
     private var previousCPUTicks: (user: UInt64, system: UInt64, idle: UInt64, nice: UInt64) = (0, 0, 0, 0)
 
+    /// Neural Engine TOPS (Tera Operations Per Second) - Apple Silicon specific
+    /// M4 Max = 38 TOPS, M3 Max = 18 TOPS, M2 Max = 15.8 TOPS, M1 Max = 11 TOPS
+    private var neuralEngineTOPS: Double = 0
+
+    /// Token throughput tracking
+    private var lastThroughput: (tokensPerSec: Double, totalTokens: Int, lastModel: String) = (0, 0, "")
+
     // MARK: - Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -162,6 +171,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         // Configure as menu bar only app (no dock icon)
         NSApp.setActivationPolicy(.accessory)
+
+        // Detect Neural Engine TOPS for this Apple Silicon chip
+        detectNeuralEngineTOPS()
 
         // Request notification permissions
         requestNotificationPermission()
@@ -178,6 +190,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         startPressureTimer()
 
         debugLog("Application initialization complete")
+    }
+
+    /// Detect Neural Engine TOPS based on Apple Silicon chip model
+    private func detectNeuralEngineTOPS() {
+        var size: Int = 0
+        sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0)
+        var chipName = [CChar](repeating: 0, count: size)
+        sysctlbyname("machdep.cpu.brand_string", &chipName, &size, nil, 0)
+        let chipString = String(cString: chipName)
+
+        // Neural Engine TOPS by chip generation
+        // Reference: Apple Silicon specifications
+        if chipString.contains("M4") {
+            if chipString.contains("Max") {
+                neuralEngineTOPS = 38.0  // M4 Max
+            } else if chipString.contains("Pro") {
+                neuralEngineTOPS = 38.0  // M4 Pro
+            } else {
+                neuralEngineTOPS = 38.0  // M4 base
+            }
+        } else if chipString.contains("M3") {
+            if chipString.contains("Max") {
+                neuralEngineTOPS = 18.0  // M3 Max
+            } else if chipString.contains("Pro") {
+                neuralEngineTOPS = 18.0  // M3 Pro
+            } else {
+                neuralEngineTOPS = 18.0  // M3 base
+            }
+        } else if chipString.contains("M2") {
+            if chipString.contains("Max") {
+                neuralEngineTOPS = 15.8  // M2 Max
+            } else if chipString.contains("Pro") {
+                neuralEngineTOPS = 15.8  // M2 Pro
+            } else if chipString.contains("Ultra") {
+                neuralEngineTOPS = 31.6  // M2 Ultra (2x M2 Max)
+            } else {
+                neuralEngineTOPS = 15.8  // M2 base
+            }
+        } else if chipString.contains("M1") {
+            if chipString.contains("Max") {
+                neuralEngineTOPS = 11.0  // M1 Max
+            } else if chipString.contains("Pro") {
+                neuralEngineTOPS = 11.0  // M1 Pro
+            } else if chipString.contains("Ultra") {
+                neuralEngineTOPS = 22.0  // M1 Ultra (2x M1 Max)
+            } else {
+                neuralEngineTOPS = 11.0  // M1 base
+            }
+        } else {
+            neuralEngineTOPS = 0  // Unknown or Intel
+        }
+
+        debugLog("Detected chip: \(chipString), Neural Engine: \(neuralEngineTOPS) TOPS")
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -266,6 +331,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         gpuItem.target = self
         gpuItem.isEnabled = true
         menu.addItem(gpuItem)
+
+        // Neural Engine TOPS item - enabled with no-op action for full opacity
+        let neItem = NSMenuItem(title: "  Neural Engine: Detecting...", action: #selector(displayOnlyAction(_:)), keyEquivalent: "")
+        neItem.tag = MenuItemTag.neuralEngineDetail.rawValue
+        neItem.target = self
+        neItem.isEnabled = true
+        menu.addItem(neItem)
+
+        // Throughput item - enabled with no-op action for full opacity
+        let throughputItem = NSMenuItem(title: "  Throughput: Idle", action: #selector(displayOnlyAction(_:)), keyEquivalent: "")
+        throughputItem.tag = MenuItemTag.throughputDetail.rawValue
+        throughputItem.target = self
+        throughputItem.isEnabled = true
+        menu.addItem(throughputItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -1435,6 +1514,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 self.updatePressureMenuItems(memory: memInfo, cpu: cpuUsage, gpu: gpuInfo)
             }
         }
+
+        // Also fetch throughput stats from server (separate async call)
+        fetchThroughputStats()
+    }
+
+    /// Fetch throughput statistics from the MageAgent server
+    private func fetchThroughputStats() {
+        guard isServerRunning else {
+            lastThroughput = (0, 0, "")
+            return
+        }
+
+        guard let url = URL(string: "\(Config.mageagentURL)/stats") else { return }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2.0
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self,
+                  let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == 200,
+                  let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return
+            }
+
+            DispatchQueue.main.async {
+                let tokensPerSec = json["last_tokens_per_sec"] as? Double ?? 0
+                let totalTokens = json["total_tokens_generated"] as? Int ?? 0
+                let lastModel = json["last_model"] as? String ?? ""
+
+                // Only update if there was recent activity (within last 30 seconds)
+                if let lastInference = json["last_inference"] as? Double {
+                    let now = Date().timeIntervalSince1970
+                    if now - lastInference < 30 {
+                        self.lastThroughput = (tokensPerSec, totalTokens, lastModel)
+                    } else {
+                        self.lastThroughput = (0, totalTokens, lastModel)  // Idle but show total
+                    }
+                } else {
+                    self.lastThroughput = (0, 0, "")
+                }
+            }
+        }.resume()
     }
 
     /// Get memory information using vm_statistics64
@@ -1548,46 +1671,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return (usage, pressure)
     }
 
-    /// Get GPU/Metal information
-    private func getGPUInfo() -> (description: String, pressure: SystemPressure) {
-        // For Apple Silicon, GPU is part of the unified memory
-        // We can estimate GPU pressure based on memory pressure when models are loaded
+    /// Get GPU/Metal information with estimated VRAM usage
+    private func getGPUInfo() -> (description: String, pressure: SystemPressure, usagePercent: Double) {
+        // For Apple Silicon, GPU shares unified memory with CPU
+        // We estimate GPU memory usage based on loaded model sizes
 
-        // Check if any large models are loaded (primary = 72B uses ~77GB)
-        let hasLargeModelLoaded = loadedModels.contains("mageagent:primary")
+        // Model sizes in GB (approximate)
+        let modelSizes: [String: Double] = [
+            "mageagent:primary": 77.0,    // Qwen-72B Q8
+            "mageagent:competitor": 18.0, // Qwen-32B Q4
+            "mageagent:tools": 9.0,       // Hermes-3 8B Q8
+            "mageagent:validator": 5.0    // Qwen-7B Q4
+        ]
 
-        // Get memory pressure to infer GPU pressure (unified memory)
-        let memInfo = getMemoryInfo()
+        // Get total unified memory
+        var totalMemory: UInt64 = 0
+        var size = MemoryLayout<UInt64>.size
+        sysctlbyname("hw.memsize", &totalMemory, &size, nil, 0)
+        let totalGB = Double(totalMemory) / (1024 * 1024 * 1024)
 
-        // If large model is loaded and memory pressure is high, GPU is likely under pressure
+        // Calculate estimated GPU memory usage from loaded models
+        var gpuUsedGB: Double = 0
+        for model in loadedModels {
+            gpuUsedGB += modelSizes[model] ?? 0
+        }
+
+        let usagePercent = (gpuUsedGB / totalGB) * 100
+
+        // Determine pressure based on GPU memory usage
         var pressure: SystemPressure = .nominal
-        var description = "Metal: Idle"
+        var description = "GPU: Idle"
 
         if isServerRunning {
-            if hasLargeModelLoaded {
-                description = "Metal: Active (72B loaded)"
-                if memInfo.pressure == .critical {
+            if gpuUsedGB > 0 {
+                // Format: "GPU: XX.X% (XXX GB)"
+                description = String(format: "GPU: %.0f%% (%.0f GB)", usagePercent, gpuUsedGB)
+
+                // Pressure thresholds for GPU memory
+                if usagePercent >= 85 {
                     pressure = .critical
-                    description = "Metal: Heavy Load (72B)"
-                } else if memInfo.pressure == .warning {
+                } else if usagePercent >= 60 {
                     pressure = .warning
-                    description = "Metal: Moderate (72B)"
                 }
-            } else if !loadedModels.isEmpty {
-                let modelCount = loadedModels.count
-                description = "Metal: Active (\(modelCount) model\(modelCount > 1 ? "s" : ""))"
             } else {
-                description = "Metal: Standby"
+                description = "GPU: 0% (Standby)"
             }
         }
 
-        return (description, pressure)
+        return (description, pressure, usagePercent)
     }
 
     /// Update the menu items with current pressure information
     private func updatePressureMenuItems(memory: (usedGB: Double, totalGB: Double, pressure: SystemPressure, percentUsed: Double),
                                          cpu: (usage: Double, pressure: SystemPressure),
-                                         gpu: (description: String, pressure: SystemPressure)) {
+                                         gpu: (description: String, pressure: SystemPressure, usagePercent: Double)) {
         // Determine overall system pressure (worst of all)
         let overallPressure: SystemPressure
         if memory.pressure == .critical || cpu.pressure == .critical || gpu.pressure == .critical {
@@ -1643,6 +1780,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
             ]))
             gpuItem.attributedTitle = gpuAttr
+        }
+
+        // Update Neural Engine TOPS - always green (informational)
+        if let neItem = menu.item(withTag: MenuItemTag.neuralEngineDetail.rawValue) {
+            let neText: String
+            if neuralEngineTOPS > 0 {
+                neText = String(format: "Neural Engine: %.0f TOPS", neuralEngineTOPS)
+            } else {
+                neText = "Neural Engine: N/A"
+            }
+            let neAttr = NSMutableAttributedString(string: "  ● ", attributes: [.foregroundColor: NSColor.systemBlue])
+            neAttr.append(NSAttributedString(string: neText, attributes: [
+                .foregroundColor: textColor,
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+            ]))
+            neItem.attributedTitle = neAttr
+        }
+
+        // Update Throughput display
+        if let throughputItem = menu.item(withTag: MenuItemTag.throughputDetail.rawValue) {
+            let throughputText: String
+            let throughputColor: NSColor
+            if lastThroughput.tokensPerSec > 0 {
+                throughputText = String(format: "Throughput: %.1f tok/s", lastThroughput.tokensPerSec)
+                throughputColor = NSColor.systemGreen
+            } else if isServerRunning {
+                throughputText = "Throughput: Idle"
+                throughputColor = NSColor.systemGray
+            } else {
+                throughputText = "Throughput: Server Offline"
+                throughputColor = NSColor.systemGray
+            }
+            let throughputAttr = NSMutableAttributedString(string: "  ● ", attributes: [.foregroundColor: throughputColor])
+            throughputAttr.append(NSAttributedString(string: throughputText, attributes: [
+                .foregroundColor: textColor,
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+            ]))
+            throughputItem.attributedTitle = throughputAttr
         }
 
         // Store current values
