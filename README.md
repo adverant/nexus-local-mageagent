@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/mageagent-logo.png" alt="MageAgent" width="120" />
+  <img src="docs/assets/mageagent-logo.png" alt="Adverant" width="400" />
 </p>
 
 <h1 align="center">Adverant Nexus Local Apple Silicon MageAgent</h1>
