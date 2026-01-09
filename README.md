@@ -16,8 +16,8 @@
 
   ### Download & Install
 
-  [![Download DMG](https://img.shields.io/badge/Download-DMG_Installer-blue?style=for-the-badge&logo=apple)](https://github.com/adverant/nexus-local-mageagent/releases/latest/download/MageAgent-2.0.0.dmg)
-  [![npm](https://img.shields.io/badge/npm-install_--g_@adverant/mageagent-red?style=for-the-badge&logo=npm)](https://www.npmjs.com/package/@adverant/mageagent)
+  [![Download DMG](https://img.shields.io/badge/Download-DMG_Installer-blue?style=for-the-badge&logo=apple)](https://github.com/adverant/nexus-local-mageagent/releases)
+  [![Git Clone](https://img.shields.io/badge/git_clone-Source_Code-green?style=for-the-badge&logo=git)](https://github.com/adverant/nexus-local-mageagent.git)
 
   ---
 
@@ -210,10 +210,6 @@ The `execute` pattern is the breakthrough feature of v2.0.
 ## Menu Bar App
 
 Control everything from your Mac menu bar:
-
-<p align="center">
-  <img src="docs/assets/menubar-screenshot.png" alt="MageAgent Menu Bar" width="300" />
-</p>
 
 - **Start/Stop/Restart** the server with one click
 - **Load models** individually or all at once
