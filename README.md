@@ -1,28 +1,19 @@
-<p align="center">
-  <img src="docs/assets/mageagent-logo.png" alt="Adverant" width="400" />
-</p>
+<div align="center">
+  <img src="docs/assets/mageagent-logo.svg" alt="Adverant Logo" width="240"/>
 
-<h1 align="center">Adverant Nexus Local Apple Silicon MageAgent</h1>
+  # MageAgent
 
-<p align="center">
-  <strong>Multi-Model AI Orchestration for Apple Silicon</strong><br>
-  <em>Run 4 specialized models together. Get results that rival cloud AI. Pay nothing.</em>
-</p>
+  **Multi-Model AI Orchestration for Apple Silicon**
 
-<p align="center">
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License" /></a>
-  <a href="https://www.apple.com/mac/"><img src="https://img.shields.io/badge/Apple_Silicon-M1/M2/M3/M4-black.svg?logo=apple" alt="Apple Silicon" /></a>
-  <a href="https://github.com/ml-explore/mlx"><img src="https://img.shields.io/badge/MLX-Native-blue.svg" alt="MLX Native" /></a>
-  <a href="https://github.com/adverant/nexus-local-mageagent/releases"><img src="https://img.shields.io/badge/Version-2.0.0-green.svg" alt="Version 2.0.0" /></a>
-</p>
+  [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+  [![Apple Silicon](https://img.shields.io/badge/Apple_Silicon-M1/M2/M3/M4-black.svg?logo=apple)](https://www.apple.com/mac/)
+  [![MLX](https://img.shields.io/badge/MLX-Native-blue.svg)](https://github.com/ml-explore/mlx)
+  [![Version](https://img.shields.io/badge/Version-2.0.0-green.svg)](https://github.com/adverant/nexus-local-mageagent/releases)
 
-<p align="center">
-  <a href="#-30-second-install">Quick Start</a> &bull;
-  <a href="#-why-mageagent">Why MageAgent</a> &bull;
-  <a href="#-orchestration-patterns">Patterns</a> &bull;
-  <a href="#-real-tool-execution">Tool Execution</a> &bull;
-  <a href="CONTRIBUTING.md">Contributing</a>
-</p>
+  *Run 4 specialized models together. Get results that rival cloud AI. Pay nothing.*
+
+  [Quick Start](#30-second-install) • [Why MageAgent](#why-mageagent) • [Patterns](#orchestration-patterns) • [Tool Execution](#real-tool-execution) • [Contributing](CONTRIBUTING.md)
+</div>
 
 ---
 
