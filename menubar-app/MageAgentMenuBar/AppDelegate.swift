@@ -1803,13 +1803,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             let throughputText: String
             let throughputColor: NSColor
             if lastThroughput.tokensPerSec > 0 {
-                throughputText = String(format: "Throughput: %.1f tok/s", lastThroughput.tokensPerSec)
+                // Active inference - show tok/s and total
+                if lastThroughput.totalTokens > 0 {
+                    throughputText = String(format: "Tokens: %.1f tok/s (%d total)", lastThroughput.tokensPerSec, lastThroughput.totalTokens)
+                } else {
+                    throughputText = String(format: "Tokens: %.1f tok/s", lastThroughput.tokensPerSec)
+                }
                 throughputColor = NSColor.systemGreen
             } else if isServerRunning {
-                throughputText = "Throughput: Idle"
+                // Idle but server running - show total tokens if any
+                if lastThroughput.totalTokens > 0 {
+                    throughputText = String(format: "Tokens: Idle (%d total)", lastThroughput.totalTokens)
+                } else {
+                    throughputText = "Tokens: Idle"
+                }
                 throughputColor = NSColor.systemGray
             } else {
-                throughputText = "Throughput: Server Offline"
+                throughputText = "Tokens: Server Offline"
                 throughputColor = NSColor.systemGray
             }
             let throughputAttr = NSMutableAttributedString(string: "  ● ", attributes: [.foregroundColor: throughputColor])
