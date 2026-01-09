@@ -211,6 +211,10 @@ The `execute` pattern is the breakthrough feature of v2.0.
 
 Control everything from your Mac menu bar:
 
+<p align="center">
+  <img src="docs/assets/menubar-screenshot.png" alt="MageAgent Menu Bar" width="400" />
+</p>
+
 - **Start/Stop/Restart** the server with one click
 - **Load models** individually or all at once
 - **Switch patterns** with automatic model loading
