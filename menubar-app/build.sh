@@ -1,17 +1,17 @@
 #!/bin/bash
-# Build MageAgent Menu Bar App
+# Build Nexus Local Compute App
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_NAME="MageAgentMenuBar"
+APP_NAME="NexusLocalCompute"
 BUILD_DIR="$SCRIPT_DIR/build"
 APP_DIR="$BUILD_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
-echo "Building MageAgent Menu Bar App..."
+echo "Building Nexus Local Compute App..."
 
 # Clean previous build
 rm -rf "$BUILD_DIR"
@@ -42,7 +42,7 @@ from PIL import Image
 import os
 
 source = "/Users/don/Adverant/Adverant.ai/public/brand/adverant-icon-github-final.png"
-output_dir = os.path.expanduser("~/.claude/MageAgentMenuBar/build/AppIcon.iconset")
+output_dir = os.environ.get("ICONSET_DIR", "build/AppIcon.iconset")
 
 img = Image.open(source).convert("RGBA")
 pixels = img.load()
@@ -75,7 +75,7 @@ iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/AppIcon.icns" 2>/dev/null || 
 cp "$HOME/.claude/mageagent-menubar/icons/icon_18x18@2x.png" "$RESOURCES_DIR/icon.png" 2>/dev/null || true
 
 # Create PkgInfo
-echo "APPLMage" > "$CONTENTS_DIR/PkgInfo"
+echo "APPLNexu" > "$CONTENTS_DIR/PkgInfo"
 
 echo ""
 echo "Build complete!"
@@ -93,4 +93,4 @@ fi
 
 echo ""
 echo "To run: open /Applications/$APP_NAME.app"
-echo "To add to Login Items: System Settings > General > Login Items > + > $APP_NAME"
+echo "To add to Login Items: System Settings > General > Login Items > + > Nexus Local Compute"

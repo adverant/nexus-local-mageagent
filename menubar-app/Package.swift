@@ -2,13 +2,13 @@
 import PackageDescription
 
 let package = Package(
-    name: "MageAgentMenuBar",
+    name: "NexusLocalCompute",
     platforms: [
         .macOS(.v13)
     ],
     targets: [
         .executableTarget(
-            name: "MageAgentMenuBar",
+            name: "NexusLocalCompute",
             path: "MageAgentMenuBar",
             resources: [
                 .process("Info.plist")

@@ -6,6 +6,8 @@ Provides OpenAI-compatible API with intelligent model routing and validation pat
 Patterns:
 - mageagent:auto - Intelligent task classification and routing
 - mageagent:execute - ReAct loop with REAL tool execution (reads files, runs commands)
+- mageagent:self_consistent - Multiple reasoning paths, +17% accuracy improvement
+- mageagent:critic - Self-critique loop for edge case detection, +10% improvement
 - mageagent:validated - Generate + validate with correction loop
 - mageagent:compete - Competing models with judge
 - mageagent:hybrid - Qwen-72B reasoning + Hermes-3 tool extraction
@@ -13,10 +15,15 @@ Patterns:
 - mageagent:primary - Direct access to 72B model
 - mageagent:validator - Direct access to 7B validator
 - mageagent:fast - Quick responses with 7B model
+
+New in v2.3:
+- Project-Specific RAG: Index codebase, inject matching patterns for style consistency
+- Self-Consistency: Generate N responses, select most consistent answer
+- CRITIC: Iterative self-critique and revision for edge case detection
 """
 
 # Version - keep in sync with package.json
-VERSION = "2.1.0"
+VERSION = "2.3.0"
 
 import asyncio
 import json
@@ -46,6 +53,7 @@ TIMEOUT_CONFIG = {
     "primary": 600,    # Qwen 72B: ~8 tok/s, 2048 tokens = 256s + buffer
     "validator": 60,   # Qwen 7B: ~105 tok/s, 2048 tokens = 20s + buffer
     "competitor": 180, # Qwen 32B: ~25 tok/s, 2048 tokens = 82s + buffer
+    "glm": 90,         # GLM-4.7 Flash: ~80 tok/s (MoE), 2048 tokens = 26s + buffer
 }
 
 # Model loading locks for thread safety (initialized after MODELS dict)
@@ -92,25 +100,101 @@ MODELS = {
         "memory_gb": 18,
         "supports_tools": False,
         "tok_per_sec": 25
+    },
+    "glm": {
+        "path": str(MLX_MODELS_DIR / "GLM-4.7-Flash-4bit"),
+        "role": "fast reasoning - 30B MoE with 3B active params, excellent for quick tasks",
+        "quant": "4bit",
+        "memory_gb": 17,
+        "supports_tools": False,
+        "tok_per_sec": 80  # MoE is faster due to sparse activation
     }
+}
+
+# Draft model for speculative decoding (1.5-3x speedup)
+DRAFT_MODEL = {
+    "path": str(MLX_MODELS_DIR / "Qwen2.5-0.5B-Instruct-4bit"),
+    "role": "draft model for speculative decoding",
+    "quant": "Q4",
+    "memory_gb": 0.5,
+    "tok_per_sec": 200  # Very fast small model
+}
+
+# Speculative decoding configuration
+# NOTE: DISABLED due to Metal GPU timeout errors on all models
+# Even the 32B model with draft model causes kIOGPUCommandBufferCallbackErrorTimeout
+# This appears to be a known issue with mlx-lm speculative decoding on some hardware
+# See: https://github.com/ml-explore/mlx-examples/issues/1281
+# The M4 Max should theoretically support this (~49% speedup reported), but
+# the current mlx-lm implementation has issues with command buffer timing
+SPECULATIVE_CONFIG = {
+    "enabled": False,  # DISABLED - causes GPU timeout crashes
+    "num_draft_tokens": 4,  # Number of tokens to draft at once
+    "applicable_models": [],  # No models currently support this without crashing
 }
 
 # Lazy-loaded models cache
 loaded_models: Dict[str, Any] = {}
 model_tokenizers: Dict[str, Any] = {}
+draft_model_cache: Dict[str, Any] = {"model": None, "tokenizer": None}  # Single draft model
 
 # Stats tracking for throughput monitoring
 inference_stats: Dict[str, Any] = {
     "total_requests": 0,
     "total_tokens_generated": 0,
+    "total_prompt_tokens": 0,
     "last_inference": None,  # timestamp
     "last_model": None,
+    "last_pattern": None,
     "last_tokens_per_sec": 0.0,
     "last_tokens_generated": 0,
     "last_duration_sec": 0.0,
     "requests_by_model": {},
     "tokens_by_model": {},
+    "requests_by_pattern": {},
+    "tokens_by_pattern": {},
+    "prompt_tokens_by_model": {},
+    "session_start": time.time(),
 }
+
+
+def update_stats(
+    model: str,
+    pattern: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    duration_sec: float
+):
+    """Update inference statistics after each request"""
+    inference_stats["total_requests"] += 1
+    inference_stats["total_tokens_generated"] += completion_tokens
+    inference_stats["total_prompt_tokens"] += prompt_tokens
+    inference_stats["last_inference"] = time.time()
+    inference_stats["last_model"] = model
+    inference_stats["last_pattern"] = pattern
+    inference_stats["last_tokens_generated"] = completion_tokens
+    inference_stats["last_duration_sec"] = duration_sec
+
+    if duration_sec > 0:
+        inference_stats["last_tokens_per_sec"] = completion_tokens / duration_sec
+    else:
+        inference_stats["last_tokens_per_sec"] = 0
+
+    # Track by model
+    if model not in inference_stats["requests_by_model"]:
+        inference_stats["requests_by_model"][model] = 0
+        inference_stats["tokens_by_model"][model] = 0
+        inference_stats["prompt_tokens_by_model"][model] = 0
+    inference_stats["requests_by_model"][model] += 1
+    inference_stats["tokens_by_model"][model] += completion_tokens
+    inference_stats["prompt_tokens_by_model"][model] += prompt_tokens
+
+    # Track by pattern
+    if pattern not in inference_stats["requests_by_pattern"]:
+        inference_stats["requests_by_pattern"][pattern] = 0
+        inference_stats["tokens_by_pattern"][pattern] = 0
+    inference_stats["requests_by_pattern"][pattern] += 1
+    inference_stats["tokens_by_pattern"][pattern] += completion_tokens
 
 # Request/Response models
 class ChatMessage(BaseModel):
@@ -174,6 +258,37 @@ def get_model(model_type: str) -> tuple:
         model_tokenizers[model_type] = tokenizer
 
     return loaded_models[model_type], model_tokenizers[model_type]
+
+
+async def load_draft_model_async() -> tuple:
+    """
+    Load the small draft model for speculative decoding.
+    Only needs to be loaded once since all models share the same draft.
+    """
+    global draft_model_cache
+
+    if draft_model_cache["model"] is not None:
+        return draft_model_cache["model"], draft_model_cache["tokenizer"]
+
+    draft_path = DRAFT_MODEL["path"]
+    if not Path(draft_path).exists():
+        print(f"Draft model not found at {draft_path}, speculative decoding disabled")
+        return None, None
+
+    print(f"Loading draft model for speculative decoding from {draft_path}...")
+    start = time.time()
+
+    loop = asyncio.get_event_loop()
+    draft_model, draft_tokenizer = await loop.run_in_executor(
+        None,
+        lambda: load(draft_path)
+    )
+
+    draft_model_cache["model"] = draft_model
+    draft_model_cache["tokenizer"] = draft_tokenizer
+    print(f"Draft model loaded in {time.time() - start:.1f}s (speculative decoding enabled)")
+
+    return draft_model, draft_tokenizer
 
 
 async def load_model_async(model_type: str) -> tuple:
@@ -249,25 +364,53 @@ def format_chat_prompt(messages: List[ChatMessage], tokenizer) -> str:
 
 
 async def _generate_internal(model_type: str, messages: List[ChatMessage], max_tokens: int, temperature: float) -> str:
-    """Internal generation function that does the actual work."""
+    """Internal generation function that does the actual work, with optional speculative decoding."""
     model, tokenizer = await load_model_async(model_type)
     prompt = format_chat_prompt(messages, tokenizer)
+
+    # Check if we should use speculative decoding for this model
+    use_speculative = (
+        SPECULATIVE_CONFIG["enabled"] and
+        model_type in SPECULATIVE_CONFIG["applicable_models"]
+    )
+
+    draft_model = None
+    if use_speculative:
+        draft_model, _ = await load_draft_model_async()
+        if draft_model is not None:
+            print(f"Using speculative decoding for {model_type} (draft: Qwen-0.5B)")
 
     # Track start time for throughput calculation
     gen_start = time.time()
 
     # Run generation in a thread pool to not block event loop
     loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            verbose=False
+
+    if draft_model is not None:
+        # Speculative decoding path - 1.5x-3x speedup for large models
+        response = await loop.run_in_executor(
+            None,
+            lambda: generate(
+                model,
+                tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                verbose=False,
+                draft_model=draft_model
+            )
         )
-    )
+    else:
+        # Standard generation path
+        response = await loop.run_in_executor(
+            None,
+            lambda: generate(
+                model,
+                tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                verbose=False
+            )
+        )
 
     # Calculate and update stats
     gen_duration = time.time() - gen_start
@@ -280,7 +423,7 @@ async def _generate_internal(model_type: str, messages: List[ChatMessage], max_t
     inference_stats["total_requests"] += 1
     inference_stats["total_tokens_generated"] += tokens_generated
     inference_stats["last_inference"] = time.time()
-    inference_stats["last_model"] = model_type
+    inference_stats["last_model"] = model_type + (" (speculative)" if draft_model else "")
     inference_stats["last_tokens_per_sec"] = round(tokens_per_sec, 1)
     inference_stats["last_tokens_generated"] = tokens_generated
     inference_stats["last_duration_sec"] = round(gen_duration, 2)
@@ -348,7 +491,15 @@ def needs_tool_extraction(prompt: str) -> bool:
         r'\bweb\b.*\bsearch\b', r'\bsearch\b.*\bweb\b', r'\bonline\b',
         r'\binternet\b', r'\burl\b', r'\bhttp', r'\bfetch\b',
         # Command patterns
-        r'\bcommand\b', r'\bterminal\b', r'\bcli\b'
+        r'\bcommand\b', r'\bterminal\b', r'\bcli\b',
+        # Additional patterns for common filesystem tasks (added for better tool triggering)
+        r'\bshow\b.*\bme\b', r'\bwhat\b.*\bin\b', r'\bwhat\b.*\bcontains\b',
+        r'\bcontents?\b', r'\bexport\b', r'\bimport\b', r'\bpackage\.json\b',
+        r'\.py\b', r'\.ts\b', r'\.js\b', r'\.md\b', r'\.yaml\b', r'\.json\b',
+        r'\bcode\b.*\bin\b', r'\bproject\b', r'\bcodebase\b', r'\brepo\b',
+        r'\bgit\b', r'\bls\b', r'\bcat\b', r'\bhead\b', r'\btail\b',
+        r'\bsummarize\b.*\bfile\b', r'\banalyze\b.*\bfile\b',
+        r'\bk8s\b', r'\bkubectl\b', r'\bdocker\b', r'\bnpm\b', r'\bpip\b'
     ]
     return any(re.search(p, prompt.lower()) for p in tool_patterns)
 
@@ -394,19 +545,54 @@ Example: "List files in /bar" → [{"tool": "Bash", "arguments": {"command": "ls
 The model's initial response was:
 {response[:1000]}
 
-What tools should be executed to complete this task? Output JSON array only:""")
+CRITICAL: The response above is just EXPLAINING how to do the task. We need to ACTUALLY DO IT by calling tools.
+
+What tools should be executed to complete this task? Output JSON array. If listing files, use Bash with ls. If reading a file, use Read. If searching, use Grep.
+
+JSON output only (no explanation):""")
     ]
 
     tool_response = await generate_with_model("tools", tool_messages, 512, 0.1)
 
-    # Parse tool calls
+    # Parse tool calls - try multiple approaches
+    print(f"  Tool extraction raw response: {tool_response[:300]}", flush=True)
+
+    # Approach 1: Find JSON array with proper bracket matching
     try:
-        match = re.search(r'\[.*\]', tool_response, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-    except:
-        pass
-    return None
+        # Look for the first [ and find matching ]
+        start = tool_response.find('[')
+        if start != -1:
+            depth = 0
+            end = start
+            for i, c in enumerate(tool_response[start:], start):
+                if c == '[':
+                    depth += 1
+                elif c == ']':
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            json_str = tool_response[start:end]
+            result = json.loads(json_str)
+            if result and isinstance(result, list):
+                print(f"  ✓ Extracted {len(result)} tool(s): {[t.get('tool') for t in result]}", flush=True)
+                return result
+    except Exception as e:
+        print(f"  Tool extraction error: {e}", flush=True)
+
+    # Approach 2: Try to extract tool info even if JSON is malformed
+    if '"tool"' in tool_response and '"Bash"' in tool_response:
+        print("  Attempting to extract Bash tool from malformed response...", flush=True)
+        try:
+            # Extract command from response
+            cmd_match = re.search(r'"command"\s*:\s*"([^"]+)"', tool_response)
+            if cmd_match:
+                return [{"tool": "Bash", "arguments": {"command": cmd_match.group(1)}}]
+        except:
+            pass
+
+    print("  No tools extracted", flush=True)
+    return []
 
 
 async def execute_extracted_tools(
@@ -742,12 +928,19 @@ async def generate_with_tool_execution(
         tool_calls = await extract_tool_calls(user_content, response)
 
         # On first iteration, be very aggressive - if no tools extracted but task seems to need them, force it
-        if iterations == 1 and not tool_calls and needs_tool_extraction(user_content):
+        print(f"  Initial tool_calls: {tool_calls}")
+        if iterations == 1 and (not tool_calls or tool_calls == []) and needs_tool_extraction(user_content):
             print("  Forcing tool extraction for data-requiring task...")
-            tool_calls = await extract_tool_calls(
-                user_content + "\n\nIMPORTANT: This task REQUIRES using tools to get real data. Do NOT just explain - execute tools!",
-                response
-            )
+            # Use a more direct prompt that focuses on the task, not the response
+            force_prompt = f"""You MUST output tools for this task. Do NOT say 'no tools needed'.
+
+Task: {user_content}
+
+Output the JSON tool call array NOW. Example: [{{"tool": "Bash", "arguments": {{"command": "ls -la /path"}}}}]
+
+JSON:"""
+            tool_calls = await extract_tool_calls(force_prompt, "")
+            print(f"  Forced tool_calls: {tool_calls}")
 
         if not tool_calls:
             # No more tools needed - return final response
@@ -812,15 +1005,227 @@ Based on these actual results, please continue with the task. If you have all th
     }
 
 
+async def generate_self_consistent(
+    messages: List[ChatMessage],
+    max_tokens: int = 2048,
+    temperature: float = 0.7,
+    num_samples: int = 3
+) -> Dict[str, Any]:
+    """
+    Self-Consistency: Generate multiple reasoning paths, select most consistent.
+    Research shows +17% accuracy improvement on complex reasoning tasks.
+
+    How it works:
+    1. Generate N diverse responses with higher temperature
+    2. Use validator to extract and compare key answers
+    3. Select the response with the most consistent/common conclusion
+    """
+    user_content = messages[-1].content if messages else ""
+
+    # Step 1: Generate N diverse responses with higher temperature for diversity
+    print(f"Step 1: Generating {num_samples} diverse reasoning paths...")
+    responses = []
+    for i in range(num_samples):
+        print(f"  Path {i+1}/{num_samples}...")
+        response = await generate_with_model(
+            "primary", messages, max_tokens,
+            temperature=max(0.7, temperature)  # Ensure diversity
+        )
+        responses.append(response)
+
+    # Step 2: Use validator to extract and compare answers
+    print("Step 2: Extracting and comparing answers...")
+
+    # Build comparison prompt
+    responses_text = "\n\n---\n\n".join([
+        f"**Response {i+1}:**\n{resp}" for i, resp in enumerate(responses)
+    ])
+
+    comparison_messages = [
+        ChatMessage(role="system", content="""You are an answer extractor and consistency checker.
+Given multiple responses to the same question, extract the KEY ANSWER/CONCLUSION from each,
+then identify the MOST CONSISTENT answer (appears most often or is most supported).
+
+Output format:
+EXTRACTED_ANSWERS:
+1. [key answer/conclusion from response 1]
+2. [key answer/conclusion from response 2]
+3. [key answer/conclusion from response 3]
+
+MOST_CONSISTENT: [the answer that appears most often or is most logically supported]
+BEST_RESPONSE_INDEX: [1, 2, or 3 - which response best represents the consistent answer]
+CONFIDENCE: [HIGH/MEDIUM/LOW based on agreement level between responses]
+REASONING: [brief explanation of why this answer is most consistent]"""),
+        ChatMessage(role="user", content=f"""Question: {user_content}
+
+{responses_text}
+
+Extract key answers and find the most consistent one:""")
+    ]
+
+    analysis = await generate_with_model("validator", comparison_messages, 1024, 0.3)
+
+    # Step 3: Select best response based on analysis
+    final_response = responses[0]  # Default to first
+    best_index = 0
+    confidence = "MEDIUM"
+
+    try:
+        # Parse the analysis to find best response
+        for line in analysis.split("\n"):
+            line_upper = line.upper().strip()
+            if "BEST_RESPONSE_INDEX:" in line_upper:
+                idx_str = line.split(":")[-1].strip()
+                idx = int(''.join(filter(str.isdigit, idx_str))) - 1
+                if 0 <= idx < len(responses):
+                    best_index = idx
+                    final_response = responses[idx]
+            elif "CONFIDENCE:" in line_upper:
+                conf = line.split(":")[-1].strip().upper()
+                if conf in ["HIGH", "MEDIUM", "LOW"]:
+                    confidence = conf
+    except Exception as e:
+        print(f"  Warning: Could not parse analysis: {e}")
+
+    return {
+        "response": final_response,
+        "num_samples": num_samples,
+        "all_responses": responses,
+        "analysis": analysis,
+        "best_index": best_index + 1,
+        "confidence": confidence,
+        "model_flow": f"primary x{num_samples} -> validator (self-consistency, confidence: {confidence})"
+    }
+
+
+async def generate_with_critic(
+    messages: List[ChatMessage],
+    max_tokens: int = 2048,
+    temperature: float = 0.7,
+    max_iterations: int = 2
+) -> Dict[str, Any]:
+    """
+    CRITIC Framework: Self-critique and revision for edge case detection.
+    Research shows +10% improvement on edge case handling.
+
+    How it works:
+    1. Generate initial response
+    2. Self-critique: Ask model to find issues, edge cases, security problems
+    3. Revise: Generate improved response addressing the critique
+    4. Repeat until no issues found or max iterations
+    """
+    user_content = messages[-1].content if messages else ""
+
+    # Step 1: Generate initial response
+    print("Step 1: Generating initial response...")
+    current_response = await generate_with_model(
+        "primary", messages, max_tokens, temperature
+    )
+
+    critiques = []
+    revision_count = 0
+
+    for iteration in range(max_iterations):
+        # Step 2: Self-critique
+        print(f"Step 2.{iteration+1}: Self-critiquing (iteration {iteration+1}/{max_iterations})...")
+
+        critique_messages = [
+            ChatMessage(role="system", content="""You are a critical code reviewer focused on finding edge cases and potential issues.
+
+Analyze the response for:
+1. EDGE CASES not handled (null, empty, negative, overflow, boundary conditions, etc.)
+2. ERROR CONDITIONS not addressed (exceptions, invalid input, network failures)
+3. ASSUMPTIONS that might not hold in production
+4. SECURITY vulnerabilities (injection, XSS, authentication bypass, etc.)
+5. PERFORMANCE issues (O(n²) when O(n) possible, memory leaks, etc.)
+6. LOGIC ERRORS (off-by-one, incorrect conditions, race conditions)
+
+Output format:
+ISSUES_FOUND: [YES/NO]
+
+If YES:
+CRITICAL_ISSUES:
+- [issue 1 with specific location/code]
+- [issue 2 with specific location/code]
+
+SUGGESTIONS:
+- [specific fix for issue 1]
+- [specific fix for issue 2]
+
+If NO issues found, output:
+ISSUES_FOUND: NO
+ASSESSMENT: Response handles edge cases appropriately."""),
+            ChatMessage(role="user", content=f"""Original question:
+{user_content}
+
+Response to critique:
+{current_response}
+
+Provide your critical analysis:""")
+        ]
+
+        critique = await generate_with_model("validator", critique_messages, 1024, 0.3)
+        critiques.append(critique)
+
+        # Step 3: Check if issues found
+        critique_upper = critique.upper()
+        no_issues = (
+            "ISSUES_FOUND: NO" in critique_upper or
+            "NO SIGNIFICANT ISSUES" in critique_upper or
+            "NO CRITICAL ISSUES" in critique_upper or
+            ("ISSUES_FOUND:" in critique_upper and "NO" in critique_upper.split("ISSUES_FOUND:")[1][:20])
+        )
+
+        if no_issues:
+            print(f"  ✓ No issues found, stopping after {iteration+1} iteration(s)")
+            break
+
+        # Step 4: Revise based on critique
+        print(f"Step 3.{iteration+1}: Revising based on critique...")
+        revision_count += 1
+
+        revision_messages = messages.copy()
+        revision_messages.append(ChatMessage(role="assistant", content=current_response))
+        revision_messages.append(ChatMessage(
+            role="user",
+            content=f"""A code review found these issues:
+
+{critique}
+
+Please provide an IMPROVED response that:
+1. Addresses ALL the identified issues and edge cases
+2. Adds proper error handling where needed
+3. Fixes any security vulnerabilities
+4. Maintains the original functionality
+
+Provide the complete corrected response:"""
+        ))
+
+        current_response = await generate_with_model(
+            "primary", revision_messages, max_tokens, temperature
+        )
+
+    final_status = "passed" if len(critiques) > 0 and "ISSUES_FOUND: NO" in critiques[-1].upper() else "max_iterations"
+
+    return {
+        "response": current_response,
+        "iterations": len(critiques),
+        "revisions": revision_count,
+        "critiques": critiques,
+        "final_status": final_status,
+        "model_flow": f"primary -> (validator-critique -> primary-revise) x{len(critiques)} [{final_status}]"
+    }
+
+
 # FastAPI app with lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Startup and shutdown lifecycle for MageAgent server.
-    Pre-loads critical models to avoid cold start timeouts.
+    Pre-loads critical models and initializes RAG integration.
     """
     print("=" * 60)
-    print("MageAgent Server v2.0 Starting...")
+    print(f"MageAgent Server v{VERSION} Starting...")
     print("=" * 60)
     print(f"Available models: {list(MODELS.keys())}")
     print(f"Timeout config: {TIMEOUT_CONFIG}")
@@ -836,9 +1241,31 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠ Warning: Could not pre-load {model_type}: {e}")
 
+    # Initialize Project-Specific RAG if project root is set
+    app.state.rag_integration = None
+    project_root = os.environ.get('MAGEAGENT_PROJECT_ROOT')
+
+    if project_root:
+        try:
+            from rag_integration import MageAgentRAGIntegration
+            print(f"\n[RAG] Initializing for project: {project_root}")
+            app.state.rag_integration = MageAgentRAGIntegration(project_root)
+            # Force initialization
+            app.state.rag_integration._ensure_initialized()
+            summary = app.state.rag_integration.get_project_summary()
+            print(f"[RAG] ✓ Indexed {summary['total_patterns']} patterns")
+            print(f"[RAG]   Language: {summary['primary_language']}")
+            print(f"[RAG]   Frameworks: {', '.join(summary['frameworks']) if summary['frameworks'] else 'None'}")
+        except Exception as e:
+            print(f"[RAG] ⚠ RAG initialization failed: {e}")
+            app.state.rag_integration = None
+    else:
+        print("\n[RAG] Disabled (set MAGEAGENT_PROJECT_ROOT to enable)")
+
     print("=" * 60)
     print(f"Server ready! Pre-loaded models: {list(loaded_models.keys())}")
     print(f"Endpoint: http://localhost:3457")
+    print(f"RAG: {'Enabled' if app.state.rag_integration else 'Disabled'}")
     print("=" * 60)
 
     yield
@@ -870,11 +1297,13 @@ app.add_middleware(
 async def root():
     return {
         "name": "MageAgent Orchestrator",
-        "version": "2.0.0",  # Major version bump for tool execution
+        "version": "2.2.0",  # Version bump for self-consistency and CRITIC patterns
         "models": list(MODELS.keys()),
         "endpoints": [
             "mageagent:auto - Intelligent routing",
             "mageagent:execute - ⭐ REAL tool execution (reads files, runs commands, web search)",
+            "mageagent:self_consistent - 🎯 Multiple reasoning paths, +17% accuracy",
+            "mageagent:critic - 🔍 Self-critique loop, +10% edge case detection",
             "mageagent:hybrid - Qwen-72B + Hermes-3 (best capability)",
             "mageagent:validated - Generate + validate",
             "mageagent:compete - Competing models",
@@ -883,7 +1312,10 @@ async def root():
             "mageagent:validator - Direct 7B access",
             "mageagent:competitor - Direct 32B access"
         ],
-        "new_in_v2": "mageagent:execute - ReAct loop that ACTUALLY executes tools instead of hallucinating"
+        "new_in_v2.2": [
+            "mageagent:self_consistent - Self-consistency pattern (+17% reasoning accuracy)",
+            "mageagent:critic - CRITIC framework (+10% edge case handling)"
+        ]
     }
 
 
@@ -892,7 +1324,9 @@ async def list_models():
     """List available models (OpenAI compatible)"""
     models = [
         ModelInfo(id="mageagent:auto", created=int(time.time())),
-        ModelInfo(id="mageagent:execute", created=int(time.time())),  # NEW: Real tool execution!
+        ModelInfo(id="mageagent:execute", created=int(time.time())),  # ReAct with real tool execution
+        ModelInfo(id="mageagent:self_consistent", created=int(time.time())),  # NEW: +17% reasoning
+        ModelInfo(id="mageagent:critic", created=int(time.time())),  # NEW: +10% edge cases
         ModelInfo(id="mageagent:hybrid", created=int(time.time())),
         ModelInfo(id="mageagent:validated", created=int(time.time())),
         ModelInfo(id="mageagent:compete", created=int(time.time())),
@@ -906,39 +1340,518 @@ async def list_models():
 
 @app.get("/health")
 async def health():
+    # Get RAG status if available
+    rag_status = None
+    if app.state.rag_integration:
+        try:
+            rag_status = app.state.rag_integration.get_project_summary()
+        except Exception:
+            rag_status = {"status": "error"}
+
     return {
         "status": "healthy",
         "version": VERSION,
         "loaded_models": list(loaded_models.keys()),
-        "available_models": list(MODELS.keys())
+        "available_models": list(MODELS.keys()),
+        "speculative_decoding": {
+            "enabled": SPECULATIVE_CONFIG["enabled"],
+            "draft_model_loaded": draft_model_cache["model"] is not None,
+            "applicable_models": SPECULATIVE_CONFIG["applicable_models"]
+        },
+        "rag": rag_status
     }
+
+
+# ================== Model Management API ==================
+
+class ModelLoadRequest(BaseModel):
+    """Request to load a specific model"""
+    model: str  # Model key (tools, primary, validator, competitor, glm)
+
+
+@app.post("/models/load")
+async def load_model_endpoint(request: ModelLoadRequest):
+    """
+    Load a specific model into GPU memory.
+
+    This endpoint allows explicit control over which models are loaded.
+    Models are loaded lazily by default, but this allows pre-loading.
+    """
+    model_key = request.model.lower().replace("mageagent:", "")
+
+    if model_key not in MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model: {request.model}. Available: {list(MODELS.keys())}"
+        )
+
+    if model_key in loaded_models:
+        return {
+            "status": "already_loaded",
+            "model": model_key,
+            "memory_gb": MODELS[model_key]["memory_gb"]
+        }
+
+    try:
+        start = time.time()
+        await load_model_async(model_key)
+        duration = time.time() - start
+
+        # Update shared state for cross-app discovery
+        update_shared_state()
+
+        return {
+            "status": "loaded",
+            "model": model_key,
+            "memory_gb": MODELS[model_key]["memory_gb"],
+            "load_time_sec": round(duration, 1)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load {model_key}: {str(e)}")
+
+
+class ModelUnloadRequest(BaseModel):
+    """Request to unload a specific model"""
+    model: str  # Model key (tools, primary, validator, competitor, glm)
+
+
+@app.post("/models/unload")
+async def unload_model_endpoint(request: ModelUnloadRequest):
+    """
+    Unload a specific model from GPU memory.
+
+    This frees up GPU memory by removing the model from the cache.
+    The model can be reloaded later on demand.
+    """
+    model_key = request.model.lower().replace("mageagent:", "")
+
+    if model_key not in MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model: {request.model}. Available: {list(MODELS.keys())}"
+        )
+
+    if model_key not in loaded_models:
+        return {
+            "status": "not_loaded",
+            "model": model_key,
+            "message": "Model was not loaded"
+        }
+
+    try:
+        memory_gb = MODELS[model_key]["memory_gb"]
+
+        # Remove from caches
+        del loaded_models[model_key]
+        if model_key in model_tokenizers:
+            del model_tokenizers[model_key]
+
+        # Force garbage collection to free GPU memory
+        import gc
+        gc.collect()
+
+        # Synchronize MLX to ensure memory is freed
+        mx.eval([])  # Empty eval to sync
+
+        # Update shared state for cross-app discovery
+        update_shared_state()
+
+        return {
+            "status": "unloaded",
+            "model": model_key,
+            "memory_freed_gb": memory_gb,
+            "loaded_models": list(loaded_models.keys())
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to unload {model_key}: {str(e)}")
+
+
+@app.post("/models/unload-all")
+async def unload_all_models():
+    """
+    Unload ALL models from GPU memory.
+
+    This is useful for freeing up all GPU memory quickly.
+    """
+    try:
+        unloaded = list(loaded_models.keys())
+        total_memory = sum(MODELS[m]["memory_gb"] for m in unloaded)
+
+        # Clear all caches
+        loaded_models.clear()
+        model_tokenizers.clear()
+
+        # Clear draft model too
+        draft_model_cache["model"] = None
+        draft_model_cache["tokenizer"] = None
+
+        # Force garbage collection
+        import gc
+        gc.collect()
+
+        # Synchronize MLX
+        mx.eval([])
+
+        # Update shared state for cross-app discovery
+        update_shared_state()
+
+        return {
+            "status": "all_unloaded",
+            "models_unloaded": unloaded,
+            "total_memory_freed_gb": total_memory
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to unload models: {str(e)}")
+
+
+@app.get("/models/status")
+async def models_status():
+    """
+    Get detailed status of all models (loaded and available).
+    """
+    model_status = {}
+
+    for model_key, model_info in MODELS.items():
+        model_status[model_key] = {
+            "loaded": model_key in loaded_models,
+            "memory_gb": model_info["memory_gb"],
+            "role": model_info["role"],
+            "quant": model_info["quant"],
+            "supports_tools": model_info.get("supports_tools", False),
+            "tok_per_sec": model_info.get("tok_per_sec", 0)
+        }
+
+    total_loaded_memory = sum(
+        MODELS[m]["memory_gb"] for m in loaded_models.keys()
+    )
+
+    return {
+        "models": model_status,
+        "loaded_models": list(loaded_models.keys()),
+        "total_loaded_memory_gb": total_loaded_memory,
+        "draft_model_loaded": draft_model_cache["model"] is not None
+    }
+
+
+# ================== Multi-App Discovery API ==================
+# These endpoints enable other apps (VSCode, Claude Code CLI, Nexus CLI)
+# to easily discover and use local models
+
+# Shared state file path for cross-app communication
+SHARED_STATE_FILE = Path.home() / ".claude" / "nexus-local-compute-state.json"
+
+
+def update_shared_state():
+    """Update the shared state file for cross-app discovery"""
+    try:
+        state = {
+            "server_url": "http://localhost:3457",
+            "version": VERSION,
+            "status": "running",
+            "loaded_models": list(loaded_models.keys()),
+            "available_models": list(MODELS.keys()),
+            "available_patterns": [
+                "mageagent:auto",
+                "mageagent:execute",
+                "mageagent:self_consistent",
+                "mageagent:critic",
+                "mageagent:validated",
+                "mageagent:compete",
+                "mageagent:hybrid",
+                "mageagent:tools",
+                "mageagent:primary",
+                "mageagent:validator",
+                "mageagent:fast"
+            ],
+            "total_loaded_memory_gb": sum(MODELS[m]["memory_gb"] for m in loaded_models.keys()),
+            "updated_at": time.time(),
+            "api_endpoints": {
+                "chat": "/v1/chat/completions",
+                "models": "/v1/models",
+                "health": "/health",
+                "status": "/models/status",
+                "load": "/models/load",
+                "unload": "/models/unload",
+                "discover": "/discover"
+            }
+        }
+
+        SHARED_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SHARED_STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
+
+    except Exception as e:
+        print(f"Warning: Could not update shared state file: {e}")
+
+
+@app.get("/discover")
+async def discover():
+    """
+    Discovery endpoint for multi-app access.
+
+    Returns comprehensive information about this server's capabilities,
+    enabling other apps to dynamically discover and use local models.
+
+    Usage from other apps:
+        curl http://localhost:3457/discover
+
+    Response includes:
+        - server_url: Base URL for API calls
+        - loaded_models: Currently loaded models (ready for inference)
+        - available_models: All models that can be loaded
+        - available_patterns: Orchestration patterns (hybrid, execute, etc.)
+        - api_endpoints: Available API endpoints with descriptions
+        - model_details: Detailed info per model (memory, speed, capabilities)
+    """
+    # Update shared state file
+    update_shared_state()
+
+    model_details = {}
+    for model_key, model_info in MODELS.items():
+        model_details[model_key] = {
+            "api_id": f"mageagent:{model_key}",
+            "loaded": model_key in loaded_models,
+            "memory_gb": model_info["memory_gb"],
+            "role": model_info["role"],
+            "quantization": model_info["quant"],
+            "supports_tools": model_info.get("supports_tools", False),
+            "tokens_per_second": model_info.get("tok_per_sec", 0),
+            "timeout_seconds": TIMEOUT_CONFIG.get(model_key, 120)
+        }
+
+    return {
+        "server_name": "Nexus Local Compute",
+        "server_url": "http://localhost:3457",
+        "version": VERSION,
+        "status": "running",
+        "openai_compatible": True,
+        "loaded_models": list(loaded_models.keys()),
+        "loaded_model_ids": [f"mageagent:{m}" for m in loaded_models.keys()],
+        "available_models": list(MODELS.keys()),
+        "available_model_ids": [f"mageagent:{m}" for m in MODELS.keys()],
+        "total_loaded_memory_gb": sum(MODELS[m]["memory_gb"] for m in loaded_models.keys()),
+        "available_patterns": [
+            {
+                "id": "mageagent:auto",
+                "name": "Auto Router",
+                "description": "Intelligent task classification and routing"
+            },
+            {
+                "id": "mageagent:execute",
+                "name": "Execute",
+                "description": "ReAct loop with REAL tool execution"
+            },
+            {
+                "id": "mageagent:self_consistent",
+                "name": "Self-Consistent",
+                "description": "Multiple reasoning paths, +17% accuracy"
+            },
+            {
+                "id": "mageagent:critic",
+                "name": "CRITIC",
+                "description": "Self-critique loop for edge cases, +10% improvement"
+            },
+            {
+                "id": "mageagent:hybrid",
+                "name": "Hybrid",
+                "description": "72B reasoning + 8B tool extraction"
+            },
+            {
+                "id": "mageagent:validated",
+                "name": "Validated",
+                "description": "Generate + validate with correction loop"
+            },
+            {
+                "id": "mageagent:compete",
+                "name": "Compete",
+                "description": "Multiple competing models with judge"
+            }
+        ],
+        "model_details": model_details,
+        "api_endpoints": {
+            "chat_completions": {
+                "path": "/v1/chat/completions",
+                "method": "POST",
+                "description": "OpenAI-compatible chat completions"
+            },
+            "list_models": {
+                "path": "/v1/models",
+                "method": "GET",
+                "description": "List available models"
+            },
+            "health": {
+                "path": "/health",
+                "method": "GET",
+                "description": "Server health check"
+            },
+            "model_status": {
+                "path": "/models/status",
+                "method": "GET",
+                "description": "Detailed model status"
+            },
+            "load_model": {
+                "path": "/models/load",
+                "method": "POST",
+                "description": "Load a model into memory"
+            },
+            "unload_model": {
+                "path": "/models/unload",
+                "method": "POST",
+                "description": "Unload a model from memory"
+            },
+            "statistics": {
+                "path": "/stats",
+                "method": "GET",
+                "description": "Inference statistics"
+            }
+        },
+        "shared_state_file": str(SHARED_STATE_FILE),
+        "usage_example": {
+            "curl": 'curl -X POST http://localhost:3457/v1/chat/completions -H "Content-Type: application/json" -d \'{"model": "mageagent:hybrid", "messages": [{"role": "user", "content": "Hello"}]}\'',
+            "python": 'import openai; client = openai.OpenAI(base_url="http://localhost:3457/v1", api_key="local"); response = client.chat.completions.create(model="mageagent:hybrid", messages=[{"role": "user", "content": "Hello"}])'
+        }
+    }
+
+
+@app.get("/rag/status")
+async def rag_status():
+    """Get detailed RAG integration status"""
+    if not app.state.rag_integration:
+        return {
+            "enabled": False,
+            "message": "Set MAGEAGENT_PROJECT_ROOT environment variable to enable"
+        }
+
+    try:
+        summary = app.state.rag_integration.get_project_summary()
+        return {
+            "enabled": True,
+            **summary
+        }
+    except Exception as e:
+        return {
+            "enabled": True,
+            "status": "error",
+            "error": str(e)
+        }
+
+
+@app.post("/rag/reindex")
+async def rag_reindex():
+    """Force re-index of project codebase"""
+    if not app.state.rag_integration:
+        raise HTTPException(status_code=400, detail="RAG not enabled")
+
+    try:
+        # Force reinitialization
+        app.state.rag_integration._initialized = False
+        app.state.rag_integration._ensure_initialized()
+        summary = app.state.rag_integration.get_project_summary()
+        return {
+            "status": "reindexed",
+            **summary
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/stats")
 async def stats():
     """Return inference statistics for monitoring throughput"""
+    session_duration = time.time() - inference_stats["session_start"]
+
     return {
-        "total_requests": inference_stats["total_requests"],
-        "total_tokens_generated": inference_stats["total_tokens_generated"],
-        "last_inference": inference_stats["last_inference"],
-        "last_model": inference_stats["last_model"],
-        "last_tokens_per_sec": inference_stats["last_tokens_per_sec"],
-        "last_tokens_generated": inference_stats["last_tokens_generated"],
-        "last_duration_sec": inference_stats["last_duration_sec"],
-        "requests_by_model": inference_stats["requests_by_model"],
-        "tokens_by_model": inference_stats["tokens_by_model"],
+        "session": {
+            "start": inference_stats["session_start"],
+            "duration_sec": round(session_duration, 1),
+            "duration_human": f"{int(session_duration // 3600)}h {int((session_duration % 3600) // 60)}m"
+        },
+        "totals": {
+            "requests": inference_stats["total_requests"],
+            "completion_tokens": inference_stats["total_tokens_generated"],
+            "prompt_tokens": inference_stats["total_prompt_tokens"],
+            "total_tokens": inference_stats["total_tokens_generated"] + inference_stats["total_prompt_tokens"]
+        },
+        "last_request": {
+            "timestamp": inference_stats["last_inference"],
+            "model": inference_stats["last_model"],
+            "pattern": inference_stats["last_pattern"],
+            "tokens_per_sec": round(inference_stats["last_tokens_per_sec"], 1),
+            "tokens_generated": inference_stats["last_tokens_generated"],
+            "duration_sec": round(inference_stats["last_duration_sec"], 2)
+        },
+        "by_model": {
+            model: {
+                "requests": inference_stats["requests_by_model"].get(model, 0),
+                "completion_tokens": inference_stats["tokens_by_model"].get(model, 0),
+                "prompt_tokens": inference_stats["prompt_tokens_by_model"].get(model, 0)
+            }
+            for model in set(list(inference_stats["requests_by_model"].keys()) +
+                           list(inference_stats["tokens_by_model"].keys()))
+        },
+        "by_pattern": {
+            pattern: {
+                "requests": inference_stats["requests_by_pattern"].get(pattern, 0),
+                "tokens": inference_stats["tokens_by_pattern"].get(pattern, 0)
+            }
+            for pattern in inference_stats["requests_by_pattern"].keys()
+        }
     }
+
+
+@app.post("/stats/reset")
+async def reset_stats():
+    """Reset all inference statistics"""
+    inference_stats["total_requests"] = 0
+    inference_stats["total_tokens_generated"] = 0
+    inference_stats["total_prompt_tokens"] = 0
+    inference_stats["last_inference"] = None
+    inference_stats["last_model"] = None
+    inference_stats["last_pattern"] = None
+    inference_stats["last_tokens_per_sec"] = 0.0
+    inference_stats["last_tokens_generated"] = 0
+    inference_stats["last_duration_sec"] = 0.0
+    inference_stats["requests_by_model"] = {}
+    inference_stats["tokens_by_model"] = {}
+    inference_stats["requests_by_pattern"] = {}
+    inference_stats["tokens_by_pattern"] = {}
+    inference_stats["prompt_tokens_by_model"] = {}
+    inference_stats["session_start"] = time.time()
+
+    return {"status": "stats_reset", "session_start": inference_stats["session_start"]}
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
-    """OpenAI-compatible chat completions endpoint"""
+    """OpenAI-compatible chat completions endpoint with optional RAG enrichment"""
 
     start_time = time.time()
     model_name = request.model
 
     # Extract user prompt for classification
     user_prompt = request.messages[-1].content if request.messages else ""
+
+    # RAG enrichment for applicable patterns
+    messages_to_use = list(request.messages)
+    rag_enriched = False
+
+    if app.state.rag_integration and model_name in [
+        "mageagent:auto", "mageagent:hybrid", "mageagent:validated",
+        "mageagent:compete", "mageagent:primary", "mageagent:self_consistent",
+        "mageagent:critic"
+    ]:
+        try:
+            messages_to_use = await app.state.rag_integration.enrich_generation_request(
+                request.messages,
+                user_prompt,
+                model_name,
+                max_patterns=3
+            )
+            if len(messages_to_use) != len(request.messages):
+                rag_enriched = True
+                print(f"[RAG] Enriched prompt with project patterns")
+        except Exception as e:
+            print(f"[RAG] Enrichment failed: {e}, using original prompt")
 
     try:
         if model_name == "mageagent:execute":
@@ -958,47 +1871,80 @@ async def chat_completions(request: ChatRequest):
 
             used_model = f"mageagent:execute ({result['model_flow']})"
 
+        elif model_name == "mageagent:self_consistent":
+            # Self-Consistency pattern: Multiple reasoning paths, select most consistent
+            # Research shows +17% accuracy improvement on complex reasoning tasks
+            result = await generate_self_consistent(
+                messages_to_use,  # RAG-enriched messages
+                request.max_tokens or 2048,
+                request.temperature or 0.7,
+                num_samples=3  # Generate 3 diverse responses
+            )
+            response_text = result["response"]
+            # Add consistency summary
+            rag_tag = " +RAG" if rag_enriched else ""
+            response_text += f"\n\n---\n*Self-consistency: {result['num_samples']} paths, best #{result['best_index']}, confidence: {result['confidence']}{rag_tag}*"
+            used_model = f"mageagent:self_consistent ({result['model_flow']})"
+
+        elif model_name == "mageagent:critic":
+            # CRITIC Framework: Self-critique and revision for edge case detection
+            # Research shows +10% improvement on edge case handling
+            result = await generate_with_critic(
+                messages_to_use,  # RAG-enriched messages
+                request.max_tokens or 2048,
+                request.temperature or 0.7,
+                max_iterations=2  # Up to 2 critique-revise cycles
+            )
+            response_text = result["response"]
+            # Add critique summary
+            rag_tag = " +RAG" if rag_enriched else ""
+            response_text += f"\n\n---\n*CRITIC: {result['iterations']} critiques, {result['revisions']} revisions, status: {result['final_status']}{rag_tag}*"
+            used_model = f"mageagent:critic ({result['model_flow']})"
+
         elif model_name == "mageagent:validated":
             # Generate + validate pattern (with real tool execution)
             result = await generate_with_validation(
-                request.messages,
+                messages_to_use,  # RAG-enriched messages
                 request.max_tokens or 2048,
                 request.temperature or 0.7
             )
             response_text = result["response"]
             # Add execution summary if tools were run
+            rag_tag = " +RAG" if rag_enriched else ""
             if result.get("tools_executed", 0) > 0:
                 tools_summary = ", ".join([o["tool"] for o in result.get("observations", [])])
-                response_text += f"\n\n---\n*Executed {result['tools_executed']} tools: {tools_summary}*"
+                response_text += f"\n\n---\n*Executed {result['tools_executed']} tools: {tools_summary}{rag_tag}*"
             used_model = f"mageagent:validated ({result.get('model_flow', '72B-Q8 -> 7B-validator')})"
 
         elif model_name == "mageagent:compete":
             # Competing models pattern (with real tool execution)
             result = await generate_competing(
-                request.messages,
+                messages_to_use,  # RAG-enriched messages
                 request.max_tokens or 2048,
                 request.temperature or 0.7
             )
             response_text = result["response"]
             # Add execution summary if tools were run
+            rag_tag = " +RAG" if rag_enriched else ""
             if result.get("tools_executed", 0) > 0:
                 tools_summary = ", ".join([o["tool"] for o in result.get("observations", [])])
-                response_text += f"\n\n---\n*Executed {result['tools_executed']} tools: {tools_summary}*"
+                response_text += f"\n\n---\n*Executed {result['tools_executed']} tools: {tools_summary}{rag_tag}*"
             winner = result.get('winner', '?')
             used_model = f"mageagent:compete ({result.get('model_flow', f'winner: {winner}')})"
 
         elif model_name == "mageagent:hybrid":
             # Hybrid pattern: Qwen-72B Q8 reasoning + Hermes-3 Q8 tools (with real execution)
             result = await generate_hybrid(
-                request.messages,
+                messages_to_use,  # RAG-enriched messages
                 request.max_tokens or 2048,
                 request.temperature or 0.7
             )
             response_text = result["response"]
             # Add execution summary if tools were run
+            rag_tag = " +RAG" if rag_enriched else ""
             if result.get("tools_executed", 0) > 0:
                 tools_summary = ", ".join([o["tool"] for o in result.get("observations", [])])
-                response_text += f"\n\n---\n*Executed {result['tools_executed']} tools: {tools_summary}*"
+                response_text += f"\n\n---\n*Executed {result['tools_executed']} tools: {tools_summary}{rag_tag}*"
             used_model = f"mageagent:hybrid ({result['model_flow']})"
 
         elif model_name == "mageagent:auto":
@@ -1009,32 +1955,34 @@ async def chat_completions(request: ChatRequest):
             if task_type == "coding":
                 # Use validation pattern for coding tasks (with real tool execution)
                 result = await generate_with_validation(
-                    request.messages,
+                    messages_to_use,  # RAG-enriched messages
                     request.max_tokens or 2048,
                     request.temperature or 0.7
                 )
                 response_text = result["response"]
+                rag_tag = " +RAG" if rag_enriched else ""
                 if result.get("tools_executed", 0) > 0:
                     tools_summary = ", ".join([o["tool"] for o in result.get("observations", [])])
-                    response_text += f"\n\n---\n*Executed {result['tools_executed']} tools: {tools_summary}*"
+                    response_text += f"\n\n---\n*Executed {result['tools_executed']} tools: {tools_summary}{rag_tag}*"
                 used_model = f"mageagent:auto->validated ({result.get('model_flow', '')})"
             elif task_type == "reasoning":
                 # Use hybrid for reasoning (with real tool execution)
                 result = await generate_hybrid(
-                    request.messages,
+                    messages_to_use,  # RAG-enriched messages
                     request.max_tokens or 2048,
                     request.temperature or 0.7
                 )
                 response_text = result["response"]
+                rag_tag = " +RAG" if rag_enriched else ""
                 if result.get("tools_executed", 0) > 0:
                     tools_summary = ", ".join([o["tool"] for o in result.get("observations", [])])
-                    response_text += f"\n\n---\n*Executed {result['tools_executed']} tools: {tools_summary}*"
+                    response_text += f"\n\n---\n*Executed {result['tools_executed']} tools: {tools_summary}{rag_tag}*"
                 used_model = f"mageagent:auto->hybrid ({result.get('model_flow', '')})"
             else:
                 # Use fast validator for simple tasks (no tools needed)
                 response_text = await generate_with_model(
                     "validator",
-                    request.messages,
+                    messages_to_use,  # RAG-enriched messages
                     request.max_tokens or 2048,
                     request.temperature or 0.7
                 )
@@ -1044,7 +1992,7 @@ async def chat_completions(request: ChatRequest):
             # Direct primary model access
             response_text = await generate_with_model(
                 "primary",
-                request.messages,
+                messages_to_use,  # RAG-enriched messages
                 request.max_tokens or 2048,
                 request.temperature or 0.7
             )
@@ -1054,7 +2002,7 @@ async def chat_completions(request: ChatRequest):
             # Direct validator model access
             response_text = await generate_with_model(
                 "validator",
-                request.messages,
+                messages_to_use,  # RAG-enriched messages
                 request.max_tokens or 2048,
                 request.temperature or 0.7
             )

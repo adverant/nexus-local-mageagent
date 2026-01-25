@@ -5,23 +5,23 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleExecutable</key>
-    <string>MageAgentMenuBar</string>
+    <string>NexusLocalCompute</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIconName</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>ai.adverant.mageagent.menubar</string>
+    <string>ai.adverant.nexus.localcompute</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>MageAgent</string>
+    <string>Nexus Local Compute</string>
     <key>CFBundleDisplayName</key>
-    <string>MageAgent</string>
+    <string>Nexus Local Compute</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.0.0</string>
+    <string>3.0.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSApplicationCategoryType</key>
